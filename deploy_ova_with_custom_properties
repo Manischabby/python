@@ -1,0 +1,353 @@
+import os
+import requests
+import tarfile
+import glob
+import argparse
+from pyVmomi import vim
+from pyVim.connect import SmartConnect, Disconnect
+import configparser
+import ssl
+from time import sleep
+
+config_file = 'config.ini'
+
+def read_value_from_config(config_file, section, key):
+    config = configparser.ConfigParser()
+    config.read(config_file)
+    return config.get(section, key, fallback=None)
+
+def download_file(url, local_filename):
+    """Download a file from a URL to a local file."""
+    try:
+        print(f"Downloading file from {url} to {local_filename}")
+        response = requests.get(url, stream=True)
+        response.raise_for_status()  # Check if the request was successful
+
+        with open(local_filename, 'wb') as file:
+            for chunk in response.iter_content(chunk_size=8192):
+                file.write(chunk)
+        print(f"Downloaded file saved as {local_filename}")
+    except requests.RequestException as e:
+        print(f"Failed to download file from {url}. Error: {e}")
+        raise
+
+def extract_ova(ova_file, extract_to):
+    """Extract an OVA file to a specified directory."""
+    try:
+        if not os.path.exists(extract_to):
+            os.makedirs(extract_to)
+        
+        print(f"Extracting {ova_file} to {extract_to}")
+        with tarfile.open(ova_file, 'r') as tar:
+            tar.extractall(path=extract_to)
+        print(f"Extraction complete. Files extracted to {extract_to}")
+    except (tarfile.TarError, OSError) as e:
+        print(f"Failed to extract {ova_file}. Error: {e}")
+        raise
+
+def remove_ova_mf(directory, extensions):
+    """Delete files with specific extensions in a given directory."""
+    try:
+        for extension in extensions:
+            pattern = os.path.join(directory, f"*{extension}")
+            for file_path in glob.glob(pattern):
+                try:
+                    os.remove(file_path)
+                    print(f"Deleted: {file_path}")
+                except OSError as e:
+                    print(f"Failed to delete {file_path}: {e}")
+                    raise
+    except Exception as e:
+        print(f"Failed to remove files with extensions {extensions} in {directory}. Error: {e}")
+        raise
+
+def get_file_name(directory, extension):
+    """Find the first file with the specified extension in the given directory."""
+    try:
+        for root, _, files in os.walk(directory):
+            for file_name in files:
+                if file_name.endswith(extension):
+                    return os.path.join(root, file_name)
+        return None
+    except Exception as e:
+        print(f"Failed to get file with extension {extension} in {directory}. Error: {e}")
+        raise
+
+def update_ovf_params(file_path, replacements):
+    """Update parameters in an OVF file."""
+    try:
+        # Read the content of the file
+        with open(file_path, 'r', encoding='utf-8') as file:
+            content = file.read()
+
+        # Perform the replacements
+        for old_string, new_string in replacements.items():
+            content = content.replace(old_string, new_string)
+
+        # Write the modified content back to the file
+        with open(file_path, 'w', encoding='utf-8') as file:
+            file.write(content)
+
+        print(f'Replacements completed in {file_path}')
+    except (OSError, IOError) as e:
+        print(f"Failed to update OVF parameters in {file_path}. Error: {e}")
+        raise
+
+def get_ovf_descriptor(ovf_path):
+    """Get the OVF descriptor from a file."""
+    try:
+        with open(ovf_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except (OSError, IOError) as e:
+        print(f"Failed to read OVF descriptor from {ovf_path}. Error: {e}")
+        raise
+
+def get_objects(si, datacenter_name, cluster_name, datastore_name):
+    """Retrieve vSphere objects like datacenter, cluster, and datastore."""
+    try:
+        content = si.RetrieveContent()
+        obj_view = content.viewManager.CreateContainerView(content.rootFolder, [vim.Datacenter], True)
+        datacenters = obj_view.view
+        obj_view.Destroy()
+
+        datacenter = None
+        for dc in datacenters:
+            if dc.name == datacenter_name:
+                datacenter = dc
+                break
+
+        if not datacenter:
+            raise ValueError(f"Datacenter '{datacenter_name}' not found")
+
+        obj_view = content.viewManager.CreateContainerView(datacenter, [vim.ComputeResource], True)
+        clusters = obj_view.view
+        obj_view.Destroy()
+
+        cluster = None
+        for cl in clusters:
+            if cl.name == cluster_name:
+                cluster = cl
+                break
+
+        if not cluster:
+            raise ValueError(f"Cluster '{cluster_name}' not found")
+
+        resource_pool = cluster.resourcePool
+        datastore = None
+        for ds in cluster.datastore:
+            if ds.name == datastore_name:
+                datastore = ds
+                break
+
+        if not datastore:
+            raise ValueError(f"Datastore '{datastore_name}' not found")
+
+        return {
+            "datacenter": datacenter,
+            "resource pool": resource_pool,
+            "datastore": datastore
+        }
+    except vim.fault.InvalidName as e:
+        print(f"Invalid name error when retrieving objects. Error: {e}")
+        raise
+    except Exception as e:
+        print(f"Failed to retrieve objects. Error: {e}")
+        raise
+
+def get_vm_by_name(content, vm_name):
+    """Retrieve a VM by its name."""
+    try:
+        container = content.rootFolder
+        view_type = [vim.VirtualMachine]
+        recursive = True
+        container_view = content.viewManager.CreateContainerView(container, view_type, recursive)
+        
+        for vm in container_view.view:
+            if vm.name == vm_name:
+                return vm
+        return None
+    except Exception as e:
+        print(f"Failed to get VM by name '{vm_name}'. Error: {e}")
+        raise
+
+def power_on_vm(si, vm_name):
+    """Power on a VM by its name."""
+    try:
+        content = si.RetrieveContent()
+        vm = get_vm_by_name(content, vm_name)
+        if vm is None:
+            print(f'VM with name "{vm_name}" not found.')
+            return
+
+        if vm.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
+            print(f'VM "{vm_name}" is already powered on.')
+            return
+
+        print(f'Powering on VM "{vm_name}"...')
+        task = vm.PowerOnVM_Task()
+        print('Power on task submitted.')
+        
+        # Wait for task to complete
+        while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+            pass
+        
+        if task.info.state == vim.TaskInfo.State.success:
+            print(f'VM "{vm_name}" powered on successfully.')
+        else:
+            print(f'Failed to power on VM "{vm_name}".')
+    except vim.fault.InvalidPowerState as e:
+        print(f"Invalid power state error when powering on VM '{vm_name}'. Error: {e}")
+        raise
+    except Exception as e:
+        print(f"Failed to power on VM '{vm_name}'. Error: {e}")
+        raise
+
+
+def delete_vm(si, vm_name):
+
+    # Search for the VM by name
+    content = si.RetrieveContent()
+    obj_view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
+    vm_list = obj_view.view
+    obj_view.Destroy()
+
+    # Find the VM
+    vm_to_delete = None
+    for vm in vm_list:
+        if vm.name == vm_name:
+            print(f"VM '{vm_name}' found, powering off the VM")
+            vm_to_delete = vm
+            break
+
+    if not vm_to_delete:
+        print(f"VM '{vm_name}' not found. Conitnuing with the new deployment")
+        return
+
+    # Power off the VM if it is running
+    if vm_to_delete.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
+        print(f"Powering off VM '{vm_name}'...")
+        task = vm_to_delete.PowerOff()
+        while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+            continue
+        if task.info.state == vim.TaskInfo.State.error:
+            print(f"Failed to power off VM '{vm_name}': {task.info.error}")
+            return
+
+    # Delete the VM
+    print(f"Deleting VM '{vm_name}'...")
+    task = vm_to_delete.Destroy()
+    while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+        continue
+    if task.info.state == vim.TaskInfo.State.success:
+        print(f"VM '{vm_name}' has been deleted.")
+    else:
+        print(f"Failed to delete VM '{vm_name}': {task.info.error}")
+
+    
+
+def ova_deploy():
+
+    """Main function to orchestrate the OVA file download, extraction, and VM deployment."""
+    try:
+        url = read_value_from_config(config_file, 'build', 'ova_url')
+        download_folder = read_value_from_config(config_file, 'build', 'download_folder')
+        downld_file = read_value_from_config(config_file, 'build', 'ovapkg')
+        output_file = os.path.join(download_folder, downld_file)
+        context = ssl._create_unverified_context()
+        vcenter = read_value_from_config(config_file, 'vc', 'ip')
+        vc_user = read_value_from_config(config_file, 'vc', 'user')
+        vc_password = read_value_from_config(config_file, 'vc', 'password')
+        datacenter_name = read_value_from_config(config_file, 'vc', 'datacenter_name')
+        cluster_name = read_value_from_config(config_file, 'vc', 'cluster_name')
+        datastore_name = read_value_from_config(config_file, 'vc', 'datastore_name')
+        vm_name = read_value_from_config(config_file, 'vc', 'vm_name')
+        
+        si = SmartConnect(
+            host=vcenter,
+            user=vc_user,
+            pwd=vc_password,
+            sslContext=context
+        )
+        print("STEP Cleanup:  Start : Delete VM if exists with default name") 
+        delete_vm(si, vm_name)
+        print("STEP Cleanup:  Success : VM instance deleted succesfully")   
+        print("STEP 1:  Start : Download the OVA file from repository ")              
+        # Download the file
+        download_file(url, output_file)
+        print("STEP 1:  Success : Download completed success ")     
+
+        print("STEP 2:  Start : Exract the OVA file ")  
+        # Extract the file if it is an OVA archive
+        if output_file.endswith('.ova'):
+            extract_ova(output_file, download_folder)
+        else:
+            print("STEP 2:  Failed :The downloaded file is not an OVA archive. No extraction performed.")
+            exit()
+        
+        # Define the file extensions to delete
+        del_extensions = ['.ova', '.mf']
+        
+        # Delete the files
+        remove_ova_mf(download_folder, del_extensions)
+        
+        print("STEP 2:  Success : OVA file extracted succesfully ") 
+        
+        print("STEP 3:  Start : Update OVF property file with required details ") 
+        # Populate OVF and VMDK names
+        ovf_name = get_file_name(download_folder, 'ovf')
+        if not ovf_name:
+            raise FileNotFoundError("OVF file not found in the extracted contents.")
+        vmdk_name = get_file_name(download_folder, 'vmdk')
+        if not vmdk_name:
+            raise FileNotFoundError("VMDK file not found in the extracted contents.")
+
+        #Define the file path and the replacements dictionary
+        custom_properties= {
+        '<Property ovf:key="network.license.std" ovf:required="true" ovf:type="boolean" ovf:userConfigurable="true">': '<Property ovf:key="network.license.std" ovf:required="true" ovf:type="boolean" ovf:userConfigurable="true" ovf:value="True">',
+        '<Property ovf:key="network.hostname" ovf:qualifiers="MinLen(1),MaxLen(65535)" ovf:type="string" ovf:userConfigurable="true" ovf:value="">': '<Property ovf:key="network.hostname" ovf:qualifiers="MinLen(1),MaxLen(65535)" ovf:type="string" ovf:userConfigurable="true" ovf:value="FILL IN YOUR HOSTNAME">',
+        '<Property ovf:key="network.DOM" ovf:qualifiers="MinLen(0),MaxLen(65535)" ovf:type="string" ovf:userConfigurable="true" ovf:value="">': '<Property ovf:key="network.DOM" ovf:qualifiers="MinLen(0),MaxLen(65535)" ovf:type="string" ovf:userConfigurable="true" ovf:value="FILL IN YOUR DOMAIN">',
+        '<Property ovf:key="network.ntpServer" ovf:qualifiers="MinLen(0),MaxLen(65535)" ovf:type="string" ovf:userConfigurable="true" ovf:value="">': '<Property ovf:key="network.ntpServer" ovf:qualifiers="MinLen(0),MaxLen(65535)" ovf:type="string" ovf:userConfigurable="true" ovf:value="FILL IN YOUR NTP SERVER">',
+        '<Property ovf:key="network.root_password" ovf:password="true" ovf:qualifiers="MinLen(9),MaxLen(256)" ovf:type="string" ovf:userConfigurable="true" ovf:value="">': '<Property ovf:key="network.root_password" ovf:password="true" ovf:qualifiers="MinLen(9),MaxLen(256)" ovf:type="string" ovf:userConfigurable="true" ovf:value="FILL IN YOUR ROOT PASSWORD">',
+        '<Property ovf:key="network.ip0" ovf:type="string" ovf:userConfigurable="true">': '<Property ovf:key="network.ip0" ovf:type="string" ovf:userConfigurable="true" ovf:value="FILL IN YOUR IP">',
+        '<Property ovf:key="network.gateway" ovf:type="string" ovf:userConfigurable="true">': '<Property ovf:key="network.gateway" ovf:type="string" ovf:userConfigurable="true" ovf:value="FILL IN YOUR GATEWAY">',
+        '<Property ovf:key="network.netmask0" ovf:type="string" ovf:userConfigurable="true">': '<Property ovf:key="network.netmask0" ovf:type="string" ovf:userConfigurable="true" ovf:value="FILL IN YOUR NETMASK">',
+        '<Property ovf:key="network.DNS" ovf:qualifiers="MinLen(1),MaxLen(256)" ovf:type="string" ovf:userConfigurable="true">': '<Property ovf:key="network.DNS" ovf:qualifiers="MinLen(1),MaxLen(256)" ovf:type="string" ovf:userConfigurable="true" ovf:value="FILL IN YOUR DNS">'
+        }
+
+        # Update the params in the OVF file
+        update_ovf_params(ovf_name, custom_properties)
+        print("STEP 3:  Success : OVF param updated succesfully ") 
+        
+        
+        print("STEP 4:  Start : Initiate VM deployment and Power ON appliance") 
+        try:
+            ovfd = get_ovf_descriptor(ovf_name)
+            objs = get_objects(si, datacenter_name, cluster_name, datastore_name)
+            manager = si.content.ovfManager
+            spec_params = vim.OvfManager.CreateImportSpecParams()
+            import_spec = manager.CreateImportSpec(ovfd,
+                                                   objs["resource pool"],
+                                                   objs["datastore"],
+                                                   spec_params)
+            lease = objs["resource pool"].ImportVApp(import_spec.importSpec,
+                                                     objs["datacenter"].vmFolder)
+            sleep(20)
+            url = lease.info.deviceUrl[0].url.replace('*', vcenter)
+            
+            curl_cmd = ("curl -Ss -X POST --insecure -T \"%s\" -H \"Content-Type: application/x-vnd.vmware-streamVmdk\" \"%s\"" %(vmdk_name, url))
+            print(f"Curl commnad  : {curl_cmd}")
+            os.system(curl_cmd)
+            lease.HttpNfcLeaseComplete()
+            power_on_vm(si, vm_name)
+            del_source = ['.ovf', '.vmdk']
+            remove_ova_mf(download_folder, del_source)
+        finally:
+            Disconnect(si)
+        print("STEP 4:  Success : VM deployment success and Powered ON")       
+
+    except Exception as e:
+        print(f"An error occurred during the VM deployment process. Error: {e}")
+        raise
+
+if __name__ == "__main__":
+    ova_deploy()

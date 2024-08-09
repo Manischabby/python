@@ -44,7 +44,7 @@ def extract_ova(ova_file, extract_to):
     except (tarfile.TarError, OSError) as e:
         print(f"Failed to extract {ova_file}. Error: {e}")
         raise
-
+#test
 def remove_ova_mf(directory, extensions):
     """Delete files with specific extensions in a given directory."""
     try:
